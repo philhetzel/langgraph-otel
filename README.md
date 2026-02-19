@@ -1,6 +1,6 @@
 # LangGraph + OpenTelemetry -> Braintrust
 
-Traces a LangGraph ReAct agent into Braintrust using OpenTelemetry (OTLP).
+Traces a custom LangGraph agent (with explicit nodes, edges, and tool calls) into Braintrust using OpenTelemetry (OTLP).
 
 ## The problem
 
