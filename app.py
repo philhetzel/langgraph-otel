@@ -11,19 +11,11 @@ The key to correct trace grouping is:
      child spans into a single trace
 """
 
-import logging
 import os
-import warnings
 
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# Suppress noisy warnings not relevant to this example (Pydantic v1 on Python 3.14,
-# LangGraph v1.0 deprecation, and OTEL mixed-type attribute warnings).
-warnings.filterwarnings("ignore", message="Core Pydantic V1")
-logging.getLogger("opentelemetry.attributes").setLevel(logging.ERROR)
-logging.getLogger("langsmith").setLevel(logging.ERROR)
 
 # ── Step 1: Configure OTEL TracerProvider (must happen before LangChain imports) ──
 
@@ -136,19 +128,19 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(tools)
 # -- Graph nodes --
 
 
-def call_model(state: MessagesState) -> dict:
+async def call_model(state: MessagesState) -> dict:
     """Call the LLM. It may return tool_calls in its response."""
-    response = llm.invoke(state["messages"])
+    response = await llm.ainvoke(state["messages"])
     return {"messages": [response]}
 
 
-def call_tools(state: MessagesState) -> dict:
+async def call_tools(state: MessagesState) -> dict:
     """Execute every tool call the LLM requested."""
     last_message: AIMessage = state["messages"][-1]
     results = []
     for call in last_message.tool_calls:
         tool_fn = tools_by_name[call["name"]]
-        result = tool_fn.invoke(call["args"])
+        result = await tool_fn.ainvoke(call["args"])
         results.append(
             ToolMessage(content=str(result), tool_call_id=call["id"])
         )
@@ -184,7 +176,7 @@ agent = graph.compile()
 tracer = trace.get_tracer("langgraph-otel-example")
 
 
-def run_agent(query: str) -> str:
+async def run_agent(query: str) -> str:
     """Invoke the agent wrapped in a root OTEL span.
 
     The root span is critical: Braintrust only shows traces that have a root
@@ -195,7 +187,7 @@ def run_agent(query: str) -> str:
         span.set_attribute("braintrust.span_attributes.type", "task")
         span.set_attribute("braintrust.input", query)
 
-        result = agent.invoke({"messages": [("user", query)]})
+        result = await agent.ainvoke({"messages": [("user", query)]})
         output = result["messages"][-1].content
 
         span.set_attribute("braintrust.output", output)
@@ -203,12 +195,12 @@ def run_agent(query: str) -> str:
 
 
 if __name__ == "__main__":
-    query = "What's the weather and population in San Francisco and Tokyo?"
-    print(f"Query: {query}\n")
+    import asyncio
 
-    response = run_agent(query)
-    print(f"Response:\n{response}")
+    async def main():
+        query = "What's the weather and population in San Francisco and Tokyo?"
+        response = await run_agent(query)
+        provider.force_flush()
+        print(response)
 
-    # Flush to make sure all spans are exported before the process exits
-    provider.force_flush()
-    print(f"\nTraces sent to Braintrust project '{bt_project}'")
+    asyncio.run(main())
