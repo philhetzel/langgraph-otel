@@ -1,7 +1,9 @@
 """
 LangGraph + OpenTelemetry -> Braintrust Tracing Example
 
-Traces a LangGraph ReAct agent into Braintrust using the OTLP exporter.
+Traces a custom LangGraph agent (with explicit nodes, edges, and tool calls)
+into Braintrust using the OTLP exporter.
+
 The key to correct trace grouping is:
   1. Set up the OTEL TracerProvider BEFORE any LangChain imports
   2. Enable LangSmith's OTEL mode so LangChain emits OTEL spans
@@ -20,7 +22,6 @@ load_dotenv()
 # Suppress noisy warnings not relevant to this example (Pydantic v1 on Python 3.14,
 # LangGraph v1.0 deprecation, and OTEL mixed-type attribute warnings).
 warnings.filterwarnings("ignore", message="Core Pydantic V1")
-warnings.filterwarnings("ignore", message="create_react_agent")
 logging.getLogger("opentelemetry.attributes").setLevel(logging.ERROR)
 logging.getLogger("langsmith").setLevel(logging.ERROR)
 
@@ -86,21 +87,28 @@ os.environ.setdefault("LANGSMITH_TRACING", "true")
 os.environ.setdefault("LANGSMITH_OTEL_ENABLED", "true")
 os.environ.setdefault("LANGSMITH_OTEL_ONLY", "true")
 
-# ── Step 3: Define the LangGraph agent ──
+# ── Step 3: Build a custom LangGraph agent with explicit nodes and edges ──
 
+from typing import Literal
+
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import MessagesState
+
+
+# -- Tools --
 
 
 @tool
 def get_weather(city: str) -> str:
     """Get the current weather for a city."""
     data = {
-        "san francisco": "Foggy, 58F",
-        "new york": "Sunny, 72F",
-        "london": "Rainy, 55F",
-        "tokyo": "Clear, 68F",
+        "san francisco": "Foggy, 58°F",
+        "new york": "Sunny, 72°F",
+        "london": "Rainy, 55°F",
+        "tokyo": "Clear, 68°F",
     }
     return data.get(city.lower(), f"No weather data for {city}")
 
@@ -117,8 +125,59 @@ def get_population(city: str) -> str:
     return data.get(city.lower(), f"No population data for {city}")
 
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-agent = create_react_agent(llm, [get_weather, get_population])
+tools = [get_weather, get_population]
+tools_by_name = {t.name: t for t in tools}
+
+# -- LLM with tools bound --
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(tools)
+
+
+# -- Graph nodes --
+
+
+def call_model(state: MessagesState) -> dict:
+    """Call the LLM. It may return tool_calls in its response."""
+    response = llm.invoke(state["messages"])
+    return {"messages": [response]}
+
+
+def call_tools(state: MessagesState) -> dict:
+    """Execute every tool call the LLM requested."""
+    last_message: AIMessage = state["messages"][-1]
+    results = []
+    for call in last_message.tool_calls:
+        tool_fn = tools_by_name[call["name"]]
+        result = tool_fn.invoke(call["args"])
+        results.append(
+            ToolMessage(content=str(result), tool_call_id=call["id"])
+        )
+    return {"messages": results}
+
+
+# -- Conditional edge --
+
+
+def should_continue(state: MessagesState) -> Literal["tools", "end"]:
+    """Route to 'tools' if the LLM made tool calls, otherwise end."""
+    last_message = state["messages"][-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return "end"
+
+
+# -- Assemble the graph --
+
+graph = StateGraph(MessagesState)
+
+graph.add_node("agent", call_model)
+graph.add_node("tools", call_tools)
+
+graph.add_edge(START, "agent")
+graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
+graph.add_edge("tools", "agent")
+
+agent = graph.compile()
 
 # ── Step 4: Run the agent inside a root span ──
 
