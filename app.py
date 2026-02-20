@@ -2,28 +2,36 @@
 LangGraph + OpenTelemetry -> Braintrust Tracing Example
 
 Traces a custom LangGraph agent (with explicit nodes, edges, and tool calls)
-into Braintrust using the OTLP exporter.
+into Braintrust via OTEL compatibility mode, demonstrating how to attach
+binary data (an image) to a trace using the Braintrust SDK.
 
 The key to correct trace grouping is:
   1. Set up the OTEL TracerProvider BEFORE any LangChain imports
   2. Enable LangSmith's OTEL mode so LangChain emits OTEL spans
-  3. Wrap agent invocations in a root span so Braintrust groups all
-     child spans into a single trace
+  3. Enable Braintrust OTEL compat mode so SDK spans and OTEL spans
+     share context and nest correctly
+  4. Wrap agent invocations in a Braintrust root span (via init_logger)
+     so all OTEL child spans group into a single trace
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Enable OTEL compatibility mode before importing braintrust.
+# This lets Braintrust SDK spans and OTEL spans share context.
+os.environ.setdefault("BRAINTRUST_OTEL_COMPAT", "true")
+
 # ── Step 1: Configure OTEL TracerProvider (must happen before LangChain imports) ──
 
+from braintrust import Attachment, init_logger
+from braintrust.otel import BraintrustSpanProcessor
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 # Map langsmith.span.kind -> braintrust span type.
 # Without this, Braintrust classifies every span with gen_ai.* attributes as "llm".
@@ -52,7 +60,6 @@ class BraintrustSpanTypeProcessor(SpanProcessor):
             span._attributes["braintrust.span_attributes.type"] = bt_type
 
 
-bt_api_key = os.environ["BRAINTRUST_API_KEY"]
 bt_project = os.environ.get("BRAINTRUST_PROJECT_NAME", "LangGraph-OTEL-Example")
 
 provider = TracerProvider(
@@ -60,15 +67,7 @@ provider = TracerProvider(
 )
 provider.add_span_processor(BraintrustSpanTypeProcessor())
 provider.add_span_processor(
-    BatchSpanProcessor(
-        OTLPSpanExporter(
-            endpoint="https://api.braintrust.dev/otel/v1/traces",
-            headers={
-                "Authorization": f"Bearer {bt_api_key}",
-                "x-bt-parent": f"project_name:{bt_project}",
-            },
-        )
-    )
+    BraintrustSpanProcessor(parent=f"project_name:{bt_project}")
 )
 trace.set_tracer_provider(provider)
 
@@ -171,26 +170,37 @@ graph.add_edge("tools", "agent")
 
 agent = graph.compile()
 
-# ── Step 4: Run the agent inside a root span ──
+# ── Step 4: Run the agent inside a Braintrust root span ──
 
-tracer = trace.get_tracer("langgraph-otel-example")
+logger = init_logger(project=bt_project)
+
+
+ASSETS_DIR = Path(__file__).parent / "assets"
 
 
 async def run_agent(query: str) -> str:
-    """Invoke the agent wrapped in a root OTEL span.
+    """Invoke the agent wrapped in a Braintrust root span.
 
-    The root span is critical: Braintrust only shows traces that have a root
-    span (a span with no parent). All LangGraph spans become children of this
-    root, producing a single grouped trace in the Braintrust UI.
+    Using a Braintrust SDK span (instead of a raw OTEL span) lets us attach
+    binary data like images via the Attachment API. With OTEL compat mode
+    enabled, the LangChain OTEL spans nest under this root automatically.
     """
-    with tracer.start_as_current_span("LangGraph Agent") as span:
-        span.set_attribute("braintrust.span_attributes.type", "task")
-        span.set_attribute("braintrust.input", query)
+    with logger.start_span(name="LangGraph Agent") as bt_span:
+        bt_span.log(input=query)
 
         result = await agent.ainvoke({"messages": [("user", query)]})
         output = result["messages"][-1].content
 
-        span.set_attribute("braintrust.output", output)
+        bt_span.log(
+            output=output,
+            metadata={
+                "test_image": Attachment(
+                    data=str(ASSETS_DIR / "test.jpeg"),
+                    filename="test.jpeg",
+                    content_type="image/jpeg",
+                ),
+            },
+        )
         return output
 
 
@@ -200,7 +210,7 @@ if __name__ == "__main__":
     async def main():
         query = "What's the weather and population in San Francisco and Tokyo?"
         response = await run_agent(query)
-        provider.force_flush()
+        logger.flush()
         print(response)
 
     asyncio.run(main())
